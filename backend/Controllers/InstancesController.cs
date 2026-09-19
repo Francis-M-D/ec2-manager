@@ -55,7 +55,10 @@ public class InstancesController : ControllerBase
             }
         }
 
-        var filtered = dnsOnly == true ? all.Where(i => i.DnsEnabled) : all;
+        // dnsOnly=true means "hide protected" — DnsEnabled now represents
+        // "protected" (DNS=Yes), so hiding protected means keeping the
+        // instances where DnsEnabled is false.
+        var filtered = dnsOnly == true ? all.Where(i => !i.DnsEnabled) : all;
 
         var result = filtered.Select(i => new InstanceListItemDto(
             i.InstanceId, i.Name, i.State, i.DnsEnabled, i.PublicIp, i.PrivateIp,

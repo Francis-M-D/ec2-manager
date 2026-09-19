@@ -7,8 +7,10 @@ live in main.py); this module defines the *behavioral* contract only.
 
 DNS tag policy (enforced by callers, and re-checked by each provider at
 execution time):
-  - Tag key "DNS", value "Yes" (case-insensitive) => dnsEnabled = True
-  - Only dnsEnabled instances may be started/stopped.
+  - Tag key "DNS", value "Yes" (case-insensitive) => this instance is
+    PROTECTED — it is DNS-critical and must never be started/stopped
+    through this tool.
+  - Only instances WITHOUT DNS=Yes may be started/stopped.
 """
 from __future__ import annotations
 
@@ -47,7 +49,7 @@ class CloudProvider(Protocol):
         ...
 
 
-def is_dns_enabled(tags: list[dict[str, str]] | None) -> bool:
-    """DNS=Yes (case-insensitive) => actionable. Missing/other => protected."""
+def is_dns_protected(tags: list[dict[str, str]] | None) -> bool:
+    """DNS=Yes (case-insensitive) => protected, must NOT be started/stopped."""
     tag_map = {t["Key"]: t["Value"] for t in (tags or [])}
     return tag_map.get("DNS", "").strip().lower() == "yes"

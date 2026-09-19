@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
 import boto3
-from botocore.credentials import RefreshableCredentials
+from botocore.credentials import DeferredRefreshableCredentials
+from botocore.exceptions import ClientError
 from botocore.session import get_session as botocore_get_session
 
 from app.config.account_config import Account, get_provider
-from app.providers.base import is_dns_enabled
+from app.providers.base import is_dns_protected
+
+logger = logging.getLogger(__name__)
 
 VALID_STATES = {
     "pending",
@@ -58,8 +63,15 @@ class AwsCloudProvider:
                 "expiry_time": creds["Expiration"].isoformat(),
             }
 
-        refreshable_creds = RefreshableCredentials.create_from_metadata(
-            metadata=refresh(),
+        # DeferredRefreshableCredentials lazily calls `refresh_using` on first
+        # use (and again on expiry) rather than requiring a pre-fetched
+        # metadata dict — this is the same pattern botocore's own
+        # AssumeRoleProvider uses internally, and is reliably picked up by
+        # every client created from this session (unlike hand-assigning a
+        # RefreshableCredentials.create_from_metadata() instance, which can
+        # silently fail to propagate depending on botocore version/session
+        # component wiring).
+        refreshable_creds = DeferredRefreshableCredentials(
             refresh_using=refresh,
             method="sts-assume-role",
         )
@@ -117,7 +129,7 @@ class AwsCloudProvider:
             "name": name,
             "state": inst["State"]["Name"],
             "tags": tags,
-            "dnsEnabled": is_dns_enabled(tags),
+            "dnsEnabled": is_dns_protected(tags),
             "publicIp": inst.get("PublicIpAddress"),
             "privateIp": inst.get("PrivateIpAddress"),
             "region": region,
@@ -125,6 +137,53 @@ class AwsCloudProvider:
             "launchTime": inst["LaunchTime"].isoformat() if inst.get("LaunchTime") else None,
             "instanceType": inst.get("InstanceType"),
         }
+
+    def _list_region(
+        self,
+        session: boto3.Session,
+        account_key: str,
+        region: str,
+        filters: list[dict[str, Any]],
+        search: str | None,
+    ) -> list[dict[str, Any]]:
+        """Fetch+serialize instances for a single region. Runs inside a
+        thread pool worker — client creation is guarded by self._lock since
+        boto3 Session objects aren't guaranteed thread-safe for concurrent
+        client construction, but the actual network call (paginate) happens
+        outside the lock so regions are queried in parallel."""
+        with self._lock:
+            ec2 = session.client("ec2", region_name=region)
+        paginator = ec2.get_paginator("describe_instances")
+        out: list[dict[str, Any]] = []
+        try:
+            pages = list(paginator.paginate(Filters=filters))
+        except ClientError as exc:
+            # A region can be listed by describe_regions() but still be
+            # unusable (e.g. a newer opt-in region — "AuthFailure" is
+            # AWS's actual error for this, not a real credential problem).
+            # Skip it rather than failing the whole multi-region request.
+            logger.warning("Skipping region %s for account %s: %s", region, account_key, exc)
+            return out
+        for page in pages:
+            for reservation in page["Reservations"]:
+                for inst in reservation["Instances"]:
+                    serialized = self._serialize_instance(inst, account_key, region)
+                    if search:
+                        haystack = " ".join(
+                            filter(
+                                None,
+                                [
+                                    serialized["instanceId"],
+                                    serialized["name"],
+                                    serialized["publicIp"],
+                                    serialized["privateIp"],
+                                ],
+                            )
+                        ).lower()
+                        if search.lower() not in haystack:
+                            continue
+                    out.append(serialized)
+        return out
 
     def list_instances(
         self,
@@ -143,35 +202,35 @@ class AwsCloudProvider:
                 raise ValueError(f"Invalid instance state(s): {sorted(bad)}")
             filters.append({"Name": "instance-state-name", "Values": statuses})
 
+        # Querying regions sequentially (one network round-trip at a time)
+        # is the dominant cost when no region filter is given — with ~18
+        # AWS regions that's 18x the per-call latency. Fan the per-region
+        # calls out across a thread pool instead; each is an independent,
+        # read-only network call, so this is safe and typically turns an
+        # 18x-latency wait into roughly 1x.
         results: list[dict[str, Any]] = []
-        for r in regions:
-            ec2 = session.client("ec2", region_name=r)
-            paginator = ec2.get_paginator("describe_instances")
-            for page in paginator.paginate(Filters=filters):
-                for reservation in page["Reservations"]:
-                    for inst in reservation["Instances"]:
-                        serialized = self._serialize_instance(inst, account_key, r)
-                        if search:
-                            haystack = " ".join(
-                                filter(
-                                    None,
-                                    [
-                                        serialized["instanceId"],
-                                        serialized["name"],
-                                        serialized["publicIp"],
-                                        serialized["privateIp"],
-                                    ],
-                                )
-                            ).lower()
-                            if search.lower() not in haystack:
-                                continue
-                        results.append(serialized)
+        if len(regions) == 1:
+            results.extend(self._list_region(session, account_key, regions[0], filters, search))
+        else:
+            with ThreadPoolExecutor(max_workers=min(10, len(regions))) as executor:
+                futures = {
+                    executor.submit(self._list_region, session, account_key, r, filters, search): r
+                    for r in regions
+                }
+                for future in as_completed(futures):
+                    results.extend(future.result())
         return results
 
     def _split_by_dns_policy(
         self, session: boto3.Session, region: str, instance_ids: list[str]
     ) -> tuple[list[str], list[dict[str, str]]]:
-        """Returns (actionable_ids, skipped=[{instanceId, reason}])."""
+        """Returns (actionable_ids, skipped=[{instanceId, reason}]).
+
+        Policy: instances tagged DNS=Yes are DNS-critical and PROTECTED —
+        they must never be started/stopped through this tool. Everything
+        else (tag missing, or DNS set to anything other than "Yes") is
+        actionable.
+        """
         ec2 = session.client("ec2", region_name=region)
         resp = ec2.describe_instances(InstanceIds=instance_ids)
         actionable: list[str] = []
@@ -180,12 +239,12 @@ class AwsCloudProvider:
         for reservation in resp["Reservations"]:
             for inst in reservation["Instances"]:
                 found_ids.add(inst["InstanceId"])
-                if is_dns_enabled(inst.get("Tags", [])):
-                    actionable.append(inst["InstanceId"])
-                else:
+                if is_dns_protected(inst.get("Tags", [])):
                     skipped.append(
-                        {"instanceId": inst["InstanceId"], "reason": "DNS tag missing or not Yes"}
+                        {"instanceId": inst["InstanceId"], "reason": "Protected: DNS tag is set to Yes"}
                     )
+                else:
+                    actionable.append(inst["InstanceId"])
         for missing in set(instance_ids) - found_ids:
             skipped.append({"instanceId": missing, "reason": "Instance not found"})
         return actionable, skipped

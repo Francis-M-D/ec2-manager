@@ -29,7 +29,7 @@ export default function InstanceDetailsModal({ instance, onClose, onAction }: Pr
         <div className="grid grid-cols-2 gap-3">
           <Info label="Instance ID" value={instance.instanceId} />
           <Info label="State" value={<StateBadge state={instance.state} />} />
-          <Info label="DNS" value={<DnsBadge enabled={instance.dnsEnabled} />} />
+          <Info label="Protected" value={<DnsBadge enabled={instance.dnsEnabled} />} />
           <Info label="Type" value={instance.instanceType ?? '—'} />
           <Info label="Public IP" value={instance.publicIp ?? '—'} />
           <Info label="Private IP" value={instance.privateIp ?? '—'} />
@@ -70,11 +70,14 @@ export default function InstanceDetailsModal({ instance, onClose, onAction }: Pr
           </div>
         </div>
 
-        <div className="flex justify-end gap-2 pt-2" title={!instance.dnsEnabled ? 'Action not allowed: DNS tag is missing or not set to Yes.' : ''}>
-          <Button variant="secondary" disabled={!instance.dnsEnabled} onClick={() => onAction('start')}>
+        <div
+          className="flex justify-end gap-2 pt-2"
+          title={instance.dnsEnabled ? 'Action not allowed: this instance is protected (DNS tag is set to Yes).' : ''}
+        >
+          <Button variant="secondary" disabled={instance.dnsEnabled} onClick={() => onAction('start')}>
             Start
           </Button>
-          <Button variant="danger" disabled={!instance.dnsEnabled} onClick={() => onAction('stop')}>
+          <Button variant="danger" disabled={instance.dnsEnabled} onClick={() => onAction('stop')}>
             Stop
           </Button>
         </div>

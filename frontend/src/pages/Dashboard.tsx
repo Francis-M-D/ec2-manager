@@ -175,7 +175,7 @@ export default function Dashboard() {
               </th>
               <th className="px-4 py-3">Name</th>
               <th className="px-4 py-3">State</th>
-              <th className="px-4 py-3">DNS</th>
+              <th className="px-4 py-3">Protected</th>
               <th className="px-4 py-3">Public IP</th>
               <th className="px-4 py-3">Private IP</th>
               <th className="px-4 py-3">Region</th>
@@ -224,10 +224,13 @@ export default function Dashboard() {
                 <td className="px-4 py-3 text-slate-600">{inst.region}</td>
                 <td className="px-4 py-3 text-slate-600">{inst.accountKey}</td>
                 <td className="px-4 py-3">
-                  <div className="flex justify-end gap-1" title={!inst.dnsEnabled ? 'Action not allowed: DNS tag is missing or not set to Yes.' : ''}>
+                  <div
+                    className="flex justify-end gap-1"
+                    title={inst.dnsEnabled ? 'Action not allowed: this instance is protected (DNS tag is set to Yes).' : ''}
+                  >
                     <Button
                       variant="secondary"
-                      disabled={!inst.dnsEnabled}
+                      disabled={inst.dnsEnabled}
                       onClick={() => requestAction('start', [inst.instanceId])}
                       className="px-2 py-1 text-xs"
                     >
@@ -235,7 +238,7 @@ export default function Dashboard() {
                     </Button>
                     <Button
                       variant="danger"
-                      disabled={!inst.dnsEnabled}
+                      disabled={inst.dnsEnabled}
                       onClick={() => requestAction('stop', [inst.instanceId])}
                       className="px-2 py-1 text-xs"
                     >
